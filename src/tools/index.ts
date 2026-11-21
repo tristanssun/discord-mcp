@@ -1,4 +1,5 @@
 import { Tool } from '@modelcontextprotocol/sdk/types.js';
+import { listGuilds, resolveGuildId, setDefaultGuild, runInGuild } from '../discord-client.js';
 
 // Import all tool definitions
 import { guildTools, executeGuildTool } from './guild.js';
@@ -23,9 +24,47 @@ import { commandTools, executeCommandTool } from './commands.js';
 import { onboardingTools, executeOnboardingTool } from './onboarding.js';
 
 /**
- * All available MCP tools for Discord server management
+ * Tools for working across several servers with one bot
  */
-export const allTools: Tool[] = [
+const multiServerTools: Tool[] = [
+  {
+    name: 'list_servers',
+    description: 'List every Discord server the bot is in, and which one is the default. Any other tool can target one of them through its "server" argument.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'set_default_server',
+    description: 'Choose the server that tools act on when called without a "server" argument. Lasts until the MCP server restarts.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        server: { type: 'string', description: 'Server name or ID' },
+      },
+      required: ['server'],
+    },
+  },
+];
+
+const SERVER_ARG_DESCRIPTION =
+  'Which Discord server to act on: name or ID (see list_servers). Omit to use the default server.';
+
+/**
+ * Add the optional "server" argument to a tool's input schema
+ */
+function withServerArg(tool: Tool): Tool {
+  return {
+    ...tool,
+    inputSchema: {
+      ...tool.inputSchema,
+      properties: {
+        ...(tool.inputSchema.properties ?? {}),
+        server: { type: 'string', description: SERVER_ARG_DESCRIPTION },
+      },
+    },
+  };
+}
+
+const singleServerTools: Tool[] = [
   ...guildTools,
   ...roleTools,
   ...channelTools,
@@ -46,6 +85,14 @@ export const allTools: Tool[] = [
   ...templateTools,
   ...commandTools,
   ...onboardingTools,
+];
+
+/**
+ * All available MCP tools for Discord server management
+ */
+export const allTools: Tool[] = [
+  ...multiServerTools,
+  ...singleServerTools.map(withServerArg),
 ];
 
 /**
@@ -157,6 +204,24 @@ for (const tool of onboardingTools) {
  * Execute a tool by name with the given arguments
  */
 export async function executeTool(name: string, args: Record<string, unknown>): Promise<string> {
+  if (name === 'list_servers') {
+    return JSON.stringify({ servers: listGuilds() }, null, 2);
+  }
+  if (name === 'set_default_server') {
+    const id = setDefaultGuild(String(args['server'] ?? ''));
+    return JSON.stringify({ defaultServer: listGuilds().find(g => g.id === id) }, null, 2);
+  }
+
+  // Route the call to the named server, leaving the default untouched
+  const { server, ...rest } = args;
+  if (typeof server === 'string' && server.trim()) {
+    const id = resolveGuildId(server);
+    return runInGuild(id, () => executeSingleServerTool(name, rest));
+  }
+  return executeSingleServerTool(name, rest);
+}
+
+async function executeSingleServerTool(name: string, args: Record<string, unknown>): Promise<string> {
   const category = toolCategories[name];
 
   if (!category) {

@@ -1,7 +1,11 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { Client, GatewayIntentBits, Partials, ChannelType, DiscordAPIError } from 'discord.js';
 
 let client: Client | null = null;
+// Default guild: used by any tool call that does not name a server
 let guildId: string | null = null;
+// Per-call guild override, so concurrent tool calls can target different servers
+const guildScope = new AsyncLocalStorage<string>();
 
 /**
  * Retry a function with exponential backoff on rate limit errors.
@@ -48,7 +52,8 @@ export interface ServerCache {
   lastUpdated: Date;
 }
 
-let serverCache: ServerCache | null = null;
+// One cache per guild, keyed by guild ID
+const serverCaches = new Map<string, ServerCache>();
 
 /**
  * Initialize the Discord client for MCP server
@@ -60,10 +65,6 @@ export async function initializeClient(): Promise<Client> {
 
   if (!token) {
     throw new Error('DISCORD_TOKEN environment variable is required');
-  }
-
-  if (!guildId) {
-    throw new Error('DISCORD_GUILD_ID environment variable is required');
   }
 
   client = new Client({
@@ -98,6 +99,11 @@ export async function initializeClient(): Promise<Client> {
     }
   });
 
+  // DISCORD_GUILD_ID is optional: with it unset, a bot in exactly one server uses that server
+  if (!guildId && client.guilds.cache.size === 1) {
+    guildId = client.guilds.cache.first()!.id;
+  }
+
   return client;
 }
 
@@ -115,10 +121,69 @@ export function getClient(): Client {
  * Get the configured guild ID
  */
 export function getGuildId(): string {
-  if (!guildId) {
-    throw new Error('Guild ID not configured. Set DISCORD_GUILD_ID environment variable.');
+  const id = guildScope.getStore() ?? guildId;
+  if (!id) {
+    throw new Error(
+      'No server selected. Pass the "server" argument (name or ID), call set_default_server, or set DISCORD_GUILD_ID. Use list_servers to see the options.',
+    );
   }
+  return id;
+}
+
+/**
+ * Get the default guild ID, or null when none is set
+ */
+export function getDefaultGuildId(): string | null {
   return guildId;
+}
+
+/**
+ * List every guild the bot is a member of
+ */
+export function listGuilds(): Array<{ id: string; name: string; memberCount: number; isDefault: boolean }> {
+  return [...getClient().guilds.cache.values()]
+    .map(g => ({ id: g.id, name: g.name, memberCount: g.memberCount, isDefault: g.id === guildId }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/**
+ * Resolve a server reference (ID, exact name, or unambiguous partial name) to a guild ID
+ */
+export function resolveGuildId(ref: string): string {
+  const guilds = listGuilds();
+  const wanted = ref.trim();
+  const norm = (v: string) => v.toLowerCase().replace(/[^a-z0-9]/g, '');
+  const describe = (list: typeof guilds) => list.map(g => `"${g.name}" (${g.id})`).join(', ') || 'none';
+
+  const byId = guilds.find(g => g.id === wanted);
+  if (byId) return byId.id;
+
+  const exact = guilds.filter(g => g.name.toLowerCase() === wanted.toLowerCase());
+  if (exact.length === 1) return exact[0]!.id;
+
+  const key = norm(wanted);
+  const partial = key ? guilds.filter(g => norm(g.name).includes(key)) : [];
+  if (partial.length === 1) return partial[0]!.id;
+
+  if (exact.length > 1 || partial.length > 1) {
+    throw new Error(`Server "${ref}" is ambiguous. Use the ID. Matches: ${describe(exact.length > 1 ? exact : partial)}`);
+  }
+  throw new Error(`Bot is not in a server matching "${ref}". Available servers: ${describe(guilds)}`);
+}
+
+/**
+ * Set the default guild used when a tool call does not name a server
+ */
+export function setDefaultGuild(ref: string): string {
+  guildId = resolveGuildId(ref);
+  return guildId;
+}
+
+/**
+ * Run a function with a specific guild as the target for everything it calls
+ */
+export function runInGuild<T>(id: string, fn: () => Promise<T>): Promise<T> {
+  return guildScope.run(id, fn);
 }
 
 /**
@@ -140,7 +205,7 @@ export async function destroyClient(): Promise<void> {
     client.destroy();
     client = null;
   }
-  serverCache = null;
+  serverCaches.clear();
 }
 
 /**
@@ -205,26 +270,24 @@ export async function refreshServerCache(): Promise<ServerCache> {
       nickname: m.nickname,
     }));
 
-  serverCache = {
+  const cache: ServerCache = {
     channels,
     roles,
     members,
     lastUpdated: new Date(),
   };
+  serverCaches.set(guild.id, cache);
 
-  console.error(`Server cache refreshed: ${channels.length} channels, ${roles.length} roles, ${members.length} members`);
+  console.error(`Server cache refreshed for ${guild.name}: ${channels.length} channels, ${roles.length} roles, ${members.length} members`);
 
-  return serverCache;
+  return cache;
 }
 
 /**
  * Get the server cache (refreshes if not initialized)
  */
 export async function getServerCache(): Promise<ServerCache> {
-  if (!serverCache) {
-    return refreshServerCache();
-  }
-  return serverCache;
+  return serverCaches.get(getGuildId()) ?? refreshServerCache();
 }
 
 /**

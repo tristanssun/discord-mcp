@@ -10,7 +10,10 @@
  *
  * Required environment variables:
  *   DISCORD_TOKEN - Your Discord bot token
- *   DISCORD_GUILD_ID - The ID of the Discord server to manage
+ *
+ * Optional environment variables:
+ *   DISCORD_GUILD_ID - The default Discord server. Tools can target any other
+ *                      server the bot is in through their "server" argument.
  */
 
 import dotenv from 'dotenv';
@@ -18,14 +21,13 @@ import dotenv from 'dotenv';
 // Load environment variables
 dotenv.config();
 
-import { initializeClient, destroyClient, refreshServerCache } from './discord-client.js';
+import { initializeClient, destroyClient, refreshServerCache, getDefaultGuildId, listGuilds } from './discord-client.js';
 import { createMCPServer, startMCPServer } from './index.js';
 
 export async function main(): Promise<void> {
   // Validate required environment variables
   // Support both DISCORD_TOKEN and BOT_TOKEN (fallback)
   const token = process.env['DISCORD_TOKEN'] || process.env['BOT_TOKEN'];
-  const guildId = process.env['DISCORD_GUILD_ID'];
 
   if (!token) {
     console.error('');
@@ -40,19 +42,6 @@ export async function main(): Promise<void> {
     process.exit(1);
   }
 
-  if (!guildId) {
-    console.error('');
-    console.error('  Error: DISCORD_GUILD_ID is not set.');
-    console.error('');
-    console.error('  Run the setup wizard to configure:');
-    console.error('    npx @quadslab.io/discord-mcp init');
-    console.error('');
-    console.error('  Or set it manually:');
-    console.error('    DISCORD_GUILD_ID=your-server-id');
-    console.error('');
-    process.exit(1);
-  }
-
   // Set DISCORD_TOKEN for the discord-client module
   process.env['DISCORD_TOKEN'] = token;
 
@@ -63,14 +52,22 @@ export async function main(): Promise<void> {
     const client = await initializeClient();
     console.error(`[discord-mcp] Logged in as ${client.user?.tag}`);
 
-    // Pre-cache server data for fast lookups
-    await refreshServerCache();
+    // Pre-cache the default server's data for fast lookups (other servers cache on first use)
+    const defaultGuildId = getDefaultGuildId();
+    if (defaultGuildId) {
+      try {
+        await refreshServerCache();
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        console.error(`[discord-mcp] Default server ${defaultGuildId} unavailable: ${reason}`);
+      }
+    }
 
     // Create and start MCP server
     const mcpServer = createMCPServer();
     await startMCPServer(mcpServer);
 
-    console.error(`[discord-mcp] Ready — guild ${guildId}`);
+    console.error(`[discord-mcp] Ready — ${listGuilds().length} server(s), default ${defaultGuildId ?? 'not set'}`);
 
     // Handle graceful shutdown
     const shutdown = async (signal: string) => {
